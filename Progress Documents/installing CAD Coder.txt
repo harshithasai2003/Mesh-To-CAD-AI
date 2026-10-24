@@ -1,0 +1,47 @@
+cd /workdir/bt730192/CAD-Coder
+
+mkdir -p /workdir/bt730192/conda/envs
+conda config --add envs_dirs /workdir/bt730192/conda/envs
+
+
+conda create -p /workdir/bt730192/conda/envs/llava python=3.10 -y
+conda activate /workdir/bt730192/conda/envs/llava
+which python
+
+pip install --upgrade pip
+pip install -e .
+pip install -e ".[train]"
+pip install datasets
+pip install peft==0.10.0
+pip install tensorboard
+
+conda activate /workdir/bt730192/conda/envs/llava
+which python
+conda activate /workdir/bt730192/conda/envs/llava
+cd /workdir/bt730192/CAD-Coder
+wget 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.2.post1/flash_attn-2.7.2.post1+cu12torch2.1cxx11abiFALSE-cp310-cp310-linux_x86_64.whl'
+
+
+pip install ./flash_attn-2.7.2.post1+cu12torch2.1cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+python -c "import flash_attn; print('FlashAttention:', flash_attn.__version__)"
+python -c "from flash_attn import flash_attn_func; print('Flash Attention import: OK')"
+
+mkdir -p /workdir/bt730192/cadcoder_data
+export CADCODER_DATA_ROOT=/workdir/bt730192/cadcoder_data
+echo $CADCODER_DATA_ROOT
+echo 'export CADCODER_DATA_ROOT=/workdir/bt730192/cadcoder_data' >> ~/.bashrc
+source ~/.bashrc
+echo $CADCODER_DATA_ROOT
+pip install -U huggingface_hub
+hf --version
+hf auth login
+
+mkdir -p "$CADCODER_DATA_ROOT/models" && \
+hf download CADCODER/CAD-Coder \
+  --local-dir "$CADCODER_DATA_ROOT/models/CAD-Coder" && \
+du -sh "$CADCODER_DATA_ROOT/models/CAD-Coder" && \
+ls -lh "$CADCODER_DATA_ROOT/models/CAD-Coder"
+
+
+	
+

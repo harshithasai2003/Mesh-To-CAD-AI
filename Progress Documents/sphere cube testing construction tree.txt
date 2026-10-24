@@ -1,0 +1,47 @@
+cd /workdir/bt730192/CAD-Coder
+conda activate /workdir/bt730192/conda/envs/llava
+
+export OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000
+
+find "$OUT" -maxdepth 1 -type d -name "checkpoint-*"
+
+CKPT=$(find "$OUT" -maxdepth 1 -type d -name "checkpoint-*" | sort -V | tail -1)
+echo "Using checkpoint: $CKPT"
+
+cat > /workdir/bt730192/CAD-Coder/inference/test_cube.jsonl <<'EOF'
+{"question_id":"test_cube","image":"test_cube.png","text":"Generate a FreeCAD Python macro for this CAD model using the provided geodata. Use the FreeCAD Python API and the Part module. Do not use CadQuery. Return only the FreeCAD Python macro."}
+EOF
+
+CUDA_VISIBLE_DEVICES=0 /workdir/bt730192/conda/envs/llava/bin/python \
+-m llava.eval.model_vqa_loader \
+--model-path "$CKPT" \
+--question-file /workdir/bt730192/CAD-Coder/inference/test_cube.jsonl \
+--image-folder /workdir/bt730192/CAD-Coder/inference \
+--answers-file /workdir/bt730192/CAD-Coder/inference/test_cube_answers.jsonl \
+--temperature 0 \
+--conv-mode llava_v1 \
+--max_new_tokens 2048
+
+cat /workdir/bt730192/CAD-Coder/inference/test_cube_answers.jsonl
+
+
+
+
+------------------sphere testing only---------------------------------------------------------------------------
+
+
+cat > /workdir/bt730192/CAD-Coder/inference/test_sphere.jsonl <<'EOF'
+{"question_id":"test_sphere","image":"test_sphere.png","text":"Generate a FreeCAD Python macro for this CAD model using the provided geodata. Use the FreeCAD Python API and the Part module. Do not use CadQuery. Return only the FreeCAD Python macro."}
+EOF
+
+CUDA_VISIBLE_DEVICES=0 /workdir/bt730192/conda/envs/llava/bin/python \
+-m llava.eval.model_vqa_loader \
+--model-path "$CKPT" \
+--question-file /workdir/bt730192/CAD-Coder/inference/test_sphere.jsonl \
+--image-folder /workdir/bt730192/CAD-Coder/inference \
+--answers-file /workdir/bt730192/CAD-Coder/inference/test_sphere_answers.jsonl \
+--temperature 0 \
+--conv-mode llava_v1 \
+--max_new_tokens 2048
+
+cat /workdir/bt730192/CAD-Coder/inference/test_sphere_answers.jsonl

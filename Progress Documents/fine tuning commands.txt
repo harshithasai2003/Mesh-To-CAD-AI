@@ -1,0 +1,689 @@
+cd /workdir/bt730192/CAD-Coder
+
+conda activate /workdir/bt730192/conda/envs/llava
+
+ls /workdir/bt730192/conda/envs/
+
+export BASE=/workdir/bt730192/cadcoder_data/models/CAD-Coder
+export DATA=/workdir/bt730192/CAD-Coder/freecad_dataset
+export IMAGES=$DATA/images
+export MACROS=$DATA/macros
+export FCSTD=$DATA/fcstd
+export GEODATA=$DATA/geodata
+export JSON=$DATA/json
+export OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000
+export WANDB_DISABLED=true
+
+mkdir -p "$GEODATA" "$JSON" "$OUT"
+
+echo "$BASE"
+echo "$DATA"
+echo "$IMAGES"
+echo "$MACROS"
+echo "$FCSTD"
+echo "$GEODATA"
+echo "$JSON"
+echo "$OUT"
+
+echo "Images:"
+find "$IMAGES" -type f | wc -l
+
+echo "Macros:"
+find "$MACROS" -type f | wc -l
+
+echo "FCStd:"
+find "$FCSTD" -type f | wc -l
+
+echo "Geodata:"
+find "$GEODATA" -type f -name '*_geometry.json' | wc -l
+
+grep -RniE "cadquery|import cq|from cadquery" "$MACROS"
+
+grep -RniE "import FreeCAD|import Part|FreeCAD as App|App\.newDocument" "$MACROS" | head -20
+
+cat > make_freecad_dataset.py <<'PY'
+from pathlib import Path
+import json
+import random
+import re
+import sys
+
+ROOT = Path("/workdir/bt730192/CAD-Coder/freecad_dataset")
+
+IMAGE_DIR = ROOT / "images"
+MACRO_DIR = ROOT / "macros"
+FCSTD_DIR = ROOT / "fcstd"
+GEODATA_DIR = ROOT / "geodata"
+OUT_DIR = ROOT / "json"
+
+SEED = 42
+TRAIN_PER_SHAPE = 70
+TEST_PER_SHAPE = 30
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def fail(msg):
+    print(f"\nERROR: {msg}\n")
+    sys.exit(1)
+
+def get_id_from_image(path):
+    m = re.fullmatch(r"(\d+)_(\d{3})\.(png|jpg|jpeg|webp)", path.name, re.I)
+    if not m:
+        return None
+    return f"{m.group(1)}_{m.group(2)}"
+
+def get_id_from_macro(path):
+    m = re.fullmatch(r"(\d+)_(\d{3})\.py", path.name, re.I)
+    if not m:
+        return None
+    return f"{m.group(1)}_{m.group(2)}"
+
+def get_id_from_fcstd(path):
+    m = re.fullmatch(r"(\d+)_(\d{3})\.FCStd", path.name, re.I)
+    if not m:
+        return None
+    return f"{m.group(1)}_{m.group(2)}"
+
+def get_id_from_geo(path):
+    m = re.fullmatch(r"(\d+)_(\d{3})_geometry\.json", path.name, re.I)
+    if not m:
+        return None
+    return f"{m.group(1)}_{m.group(2)}"
+
+# ------------------------------------------------------------
+# Discover files
+# ------------------------------------------------------------
+
+images = {}
+for p in IMAGE_DIR.iterdir():
+    if p.is_file():
+        sid = get_id_from_image(p)
+        if sid:
+            images[sid] = p
+
+macros = {}
+for p in MACRO_DIR.iterdir():
+    if p.is_file():
+        sid = get_id_from_macro(p)
+        if sid:
+            macros[sid] = p
+
+fcstds = {}
+for p in FCSTD_DIR.iterdir():
+    if p.is_file():
+        sid = get_id_from_fcstd(p)
+        if sid:
+            fcstds[sid] = p
+
+geodata = {}
+for p in GEODATA_DIR.iterdir():
+    if p.is_file():
+        sid = get_id_from_geo(p)
+        if sid:
+            geodata[sid] = p
+
+print(f"Images : {len(images)}")
+print(f"Macros : {len(macros)}")
+print(f"FCStd  : {len(fcstds)}")
+print(f"Geodata: {len(geodata)}")
+
+if len(images) != 2000:
+    fail(f"Expected 2000 images, found {len(images)}")
+
+if len(macros) != 2000:
+    fail(f"Expected 2000 macros, found {len(macros)}")
+
+if len(fcstds) != 2000:
+    fail(f"Expected 2000 FCStd files, found {len(fcstds)}")
+
+if len(geodata) != 2000:
+    fail(f"Expected 2000 geometry JSON files, found {len(geodata)}")
+
+all_ids = set(images)
+
+missing_macro = sorted(all_ids - set(macros))
+missing_fcstd = sorted(all_ids - set(fcstds))
+missing_geo = sorted(all_ids - set(geodata))
+
+if missing_macro:
+    fail(f"Missing macros, examples: {missing_macro[:10]}")
+
+if missing_fcstd:
+    fail(f"Missing FCStd files, examples: {missing_fcstd[:10]}")
+
+if missing_geo:
+    fail(f"Missing geodata, examples: {missing_geo[:10]}")
+
+# ------------------------------------------------------------
+# Validate exactly 20 shapes x 100 variants
+# ------------------------------------------------------------
+
+groups = {}
+
+for sid in sorted(all_ids):
+    base, variant = sid.split("_")
+    variant_num = int(variant)
+
+    groups.setdefault(base, []).append(variant_num)
+
+if len(groups) != 20:
+    fail(f"Expected 20 shapes, found {len(groups)}")
+
+for base, variants in sorted(groups.items(), key=lambda x: int(x[0])):
+    variants = sorted(variants)
+
+    if variants != list(range(1, 101)):
+        fail(
+            f"Shape {base} does not contain exactly variants 001-100. "
+            f"Found: {variants}"
+        )
+
+print("\nDataset structure: OK")
+print("20 shapes x 100 variants = 2000 samples")
+
+# ------------------------------------------------------------
+# Build records
+# ------------------------------------------------------------
+
+SYSTEM_PROMPT = """Generate a FreeCAD Python macro for this CAD model using the provided geodata.
+Use the FreeCAD Python API and the Part module.
+Do not use CadQuery.
+Return only the FreeCAD Python macro."""
+
+records = {}
+
+for sid in sorted(all_ids):
+    try:
+        geo = json.loads(geodata[sid].read_text(encoding="utf-8"))
+    except Exception as e:
+        fail(f"Could not read geodata {geodata[sid]}: {e}")
+
+    if not isinstance(geo, dict):
+        fail(f"Geodata must be a JSON object: {geodata[sid]}")
+
+    geo_text = json.dumps(
+        geo,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":")
+    )
+
+    macro_text = macros[sid].read_text(encoding="utf-8")
+
+    if "cadquery" in macro_text.lower():
+        fail(f"CadQuery detected in macro: {macros[sid]}")
+
+    image_path = images[sid]
+    fcstd_path = fcstds[sid]
+
+    prompt = (
+        "<image>\n"
+        + SYSTEM_PROMPT
+        + "\n\n"
+        + "Geodata:\n"
+        + geo_text
+    )
+
+    records[sid] = {
+        "id": sid,
+        "image": image_path.name,
+        "fcstd": fcstd_path.name,
+        "geodata": geodata[sid].name,
+        "base_id": sid.split("_")[0],
+        "variant": int(sid.split("_")[1]),
+        "conversations": [
+            {
+                "from": "human",
+                "value": prompt
+            },
+            {
+                "from": "gpt",
+                "value": macro_text
+            }
+        ]
+    }
+
+# ------------------------------------------------------------
+# Random 70/30 split PER SHAPE
+# ------------------------------------------------------------
+
+rng = random.Random(SEED)
+
+train = []
+test = []
+
+for base in sorted(groups.keys(), key=int):
+    ids = [
+        f"{base}_{v:03d}"
+        for v in range(1, 101)
+    ]
+
+    rng.shuffle(ids)
+
+    train_ids = ids[:TRAIN_PER_SHAPE]
+    test_ids = ids[TRAIN_PER_SHAPE:]
+
+    if len(train_ids) != 70:
+        fail(f"Shape {base}: training count is not 70")
+
+    if len(test_ids) != 30:
+        fail(f"Shape {base}: test count is not 30")
+
+    if set(train_ids) & set(test_ids):
+        fail(f"Shape {base}: train/test overlap detected")
+
+    train.extend(records[x] for x in train_ids)
+    test.extend(records[x] for x in test_ids)
+
+# Final shuffle of the combined sets
+rng.shuffle(train)
+rng.shuffle(test)
+
+if len(train) != 1400:
+    fail(f"Expected 1400 training samples, got {len(train)}")
+
+if len(test) != 600:
+    fail(f"Expected 600 test samples, got {len(test)}")
+
+train_ids = {x["id"] for x in train}
+test_ids = {x["id"] for x in test}
+
+if train_ids & test_ids:
+    fail("Global train/test overlap detected")
+
+# ------------------------------------------------------------
+# Write training JSON
+# ------------------------------------------------------------
+
+(OUT_DIR / "train.json").write_text(
+    json.dumps(train, ensure_ascii=False, indent=2),
+    encoding="utf-8"
+)
+
+# This contains ground truth and is useful for later evaluation.
+(OUT_DIR / "test.json").write_text(
+    json.dumps(test, ensure_ascii=False, indent=2),
+    encoding="utf-8"
+)
+
+# ------------------------------------------------------------
+# Write test JSONL for LLaVA inference
+# No macro answer is included.
+# ------------------------------------------------------------
+
+with (OUT_DIR / "test_eval.jsonl").open("w", encoding="utf-8") as f:
+    for r in test:
+        human_prompt = r["conversations"][0]["value"]
+
+        item = {
+            "question_id": r["id"],
+            "image": r["image"],
+            "text": human_prompt
+        }
+
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+# ------------------------------------------------------------
+# Split report
+# ------------------------------------------------------------
+
+report = {
+    "seed": SEED,
+    "total": 2000,
+    "train": 1400,
+    "test": 600,
+    "shapes": 20,
+    "variants_per_shape": 100,
+    "train_per_shape": 70,
+    "test_per_shape": 30,
+    "train_ids": sorted(train_ids),
+    "test_ids": sorted(test_ids)
+}
+
+(OUT_DIR / "split_report.json").write_text(
+    json.dumps(report, indent=2),
+    encoding="utf-8"
+)
+
+print("\nSUCCESS")
+print("Training samples :", len(train))
+print("Test samples     :", len(test))
+print("Train/test overlap:", len(train_ids & test_ids))
+print("\nCreated:")
+print(OUT_DIR / "train.json")
+print(OUT_DIR / "test.json")
+print(OUT_DIR / "test_eval.jsonl")
+print(OUT_DIR / "split_report.json")
+PY
+
+
+python make_freecad_dataset.py
+
+python - <<'PY'
+import json
+
+p = "/workdir/bt730192/CAD-Coder/freecad_dataset/json/train.json"
+
+data = json.load(open(p))
+
+print("TRAIN:", len(data))
+print()
+print(json.dumps(data[0], indent=2, ensure_ascii=False)[:5000])
+PY
+
+
+python - <<'PY'
+import json
+from collections import Counter
+
+train = json.load(open("/workdir/bt730192/CAD-Coder/freecad_dataset/json/train.json"))
+test = json.load(open("/workdir/bt730192/CAD-Coder/freecad_dataset/json/test.json"))
+
+tr = Counter(x["base_id"] for x in train)
+te = Counter(x["base_id"] for x in test)
+
+for shape in sorted(tr, key=int):
+    print(
+        f"Shape {shape:>2}: "
+        f"train={tr[shape]:2d}, "
+        f"test={te[shape]:2d}"
+    )
+
+train_ids = {x["id"] for x in train}
+test_ids = {x["id"] for x in test}
+
+print()
+print("Train:", len(train_ids))
+print("Test :", len(test_ids))
+print("Overlap:", len(train_ids & test_ids))
+PY
+
+python -m llava.train.train_mem --help 2>&1 | grep -E \
+"model_name_or_path|data_path|image_folder|vision_tower|output_dir|lora_enable|lora_weight_path|lora_r|lora_alpha|lora_dropout|num_train_epochs|learning_rate|save_strategy|bf16|gradient_checkpointing"
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+ls -la "$OUT"
+
+CUDA_VISIBLE_DEVICES=0 python -m llava.train.train_mem \
+  --model_name_or_path "$BASE" \
+  --version v1 \
+  --data_path "$DATA/json/train.json" \
+  --image_folder "$DATA/images" \
+  --vision_tower openai/clip-vit-large-patch14-336 \
+  --mm_projector_type mlp2x_gelu \
+  --mm_use_im_start_end False \
+  --mm_use_im_patch_token False \
+  --image_aspect_ratio pad \
+  --lazy_preprocess True \
+  --output_dir "$OUT" \
+  --lora_enable True \
+  --lora_r 128 \
+  --lora_alpha 256 \
+  --lora_dropout 0.05 \
+  --bf16 True \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 16 \
+  --learning_rate 1e-5 \
+  --num_train_epochs 3 \
+  --gradient_checkpointing True \
+  --save_strategy epoch \
+  --save_total_limit 3 \
+  --logging_steps 1 \
+  --report_to none \
+  2>&1 | tee "$OUT/training.log"
+
+Training till here.
+
+cd /workdir/bt730192/CAD-Coder
+conda activate /workdir/bt730192/conda/envs/llava
+
+export BASE=/workdir/bt730192/cadcoder_data/models/CAD-Coder
+export DATA=/workdir/bt730192/CAD-Coder/freecad_dataset
+export IMAGES=$DATA/images
+export MACROS=$DATA/macros
+export FCSTD=$DATA/fcstd
+export GEODATA=$DATA/geodata
+export JSON=$DATA/json
+export OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000
+
+echo "BASE=$BASE"
+echo "DATA=$DATA"
+echo "OUT=$OUT"
+mkdir -p "$OUT/test_batches"
+mkdir -p "$OUT/test_answers"
+mkdir -p "$OUT/test_logs"
+
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+base = Path("/workdir/bt730192/CAD-Coder/freecad_dataset/json")
+out = Path("/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000/test_batches")
+
+data = [json.loads(x) for x in (base / "test_eval.jsonl").read_text().splitlines() if x.strip()]
+
+assert len(data) == 600, len(data)
+
+batch_size = 50
+
+for i in range(0, len(data), batch_size):
+    batch_id = i // batch_size + 1
+    batch = data[i:i + batch_size]
+
+    p = out / f"batch_{batch_id:02d}.jsonl"
+
+    with p.open("w") as f:
+        for x in batch:
+            f.write(json.dumps(x, ensure_ascii=False) + "\n")
+
+    print(f"{p.name}: {len(batch)} records")
+
+print("TOTAL:", len(data))
+PY
+
+CKPT=$(find "$OUT" -maxdepth 1 -type d -name "checkpoint-*" | sort -V | tail -1)
+echo "$CKPT"
+
+test -d "$CKPT" && echo "CHECKPOINT OK"
+
+sed -i 's|source /workdir/bt730192/conda/envs/llava/bin/activate|conda activate /workdir/bt730192/conda/envs/llava|' "$OUT/run_test_batch.sh"
+
+head -10 "$OUT/run_test_batch.sh"
+mkdir -p "$OUT/test_batches" "$OUT/test_answers" "$OUT/test_logs"
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+src = Path("/workdir/bt730192/CAD-Coder/freecad_dataset/json/test_eval.jsonl")
+out = Path("/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000/test_batches")
+
+rows = [json.loads(x) for x in src.read_text().splitlines() if x.strip()]
+assert len(rows) == 600
+
+for i in range(12):
+    batch = rows[i*50:(i+1)*50]
+    (out / f"batch_{i+1:02d}.jsonl").write_text(
+        "\n".join(json.dumps(x, ensure_ascii=False) for x in batch) + "\n"
+    )
+    print(i+1, len(batch))
+PY
+
+cd /workdir/bt730192/CAD-Coder
+
+export OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000
+
+cat > "$OUT/run_test_batch.sh" <<'SH'
+#!/bin/bash
+set -e
+
+cd /workdir/bt730192/CAD-Coder
+
+PYTHON=/workdir/bt730192/conda/envs/llava/bin/python
+
+export BASE=/workdir/bt730192/cadcoder_data/models/CAD-Coder
+export DATA=/workdir/bt730192/CAD-Coder/freecad_dataset
+export IMAGES=$DATA/images
+export OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000
+
+BATCH_ID="$1"
+
+if [ -z "$BATCH_ID" ]; then
+    echo "Usage: $0 BATCH_ID"
+    exit 1
+fi
+
+BATCH_FILE="$OUT/test_batches/batch_$(printf '%02d' "$BATCH_ID").jsonl"
+ANSWER_FILE="$OUT/test_answers/batch_$(printf '%02d' "$BATCH_ID")_answers.jsonl"
+LOG_FILE="$OUT/test_logs/batch_$(printf '%02d' "$BATCH_ID").log"
+
+if [ ! -f "$BATCH_FILE" ]; then
+    echo "ERROR: batch file not found: $BATCH_FILE"
+    exit 1
+fi
+
+if [ -f "$ANSWER_FILE" ]; then
+    echo "Already completed: $ANSWER_FILE"
+    exit 0
+fi
+
+CKPT=$(find "$OUT" -maxdepth 1 -type d -name "checkpoint-*" | sort -V | tail -1)
+
+if [ ! -d "$CKPT" ]; then
+    echo "ERROR: checkpoint not found"
+    exit 1
+fi
+
+echo "Checkpoint: $CKPT"
+echo "Batch: $BATCH_FILE"
+echo "Output: $ANSWER_FILE"
+
+CUDA_VISIBLE_DEVICES=0 "$PYTHON" -m llava.eval.model_vqa_loader \
+    --model-path "$CKPT" \
+    --question-file "$BATCH_FILE" \
+    --image-folder "$IMAGES" \
+    --answers-file "$ANSWER_FILE" \
+    --temperature 0 \
+    --conv-mode llava_v1 \
+    --max_new_tokens 2048 \
+    2>&1 | tee "$LOG_FILE"
+
+echo "DONE: $ANSWER_FILE"
+SH
+
+chmod +x "$OUT/run_test_batch.sh"
+
+cd /workdir/bt730192/CAD-Coder
+
+export DATA=/workdir/bt730192/CAD-Coder/freecad_dataset
+export OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+src = Path("/workdir/bt730192/CAD-Coder/freecad_dataset/json/test_eval.jsonl")
+tmp = src.with_suffix(".fixed.jsonl")
+
+rows = [json.loads(x) for x in src.read_text().splitlines() if x.strip()]
+
+assert len(rows) == 600, f"Expected 600, got {len(rows)}"
+
+for r in rows:
+    r["text"] = r["text"].replace("<image>\n", "").replace("<image>", "").strip()
+
+tmp.write_text(
+    "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n"
+)
+
+tmp.replace(src)
+
+print("Fixed:", len(rows), "test records")
+print("Remaining <image> tokens:",
+      sum(r["text"].count("<image>") for r in rows))
+PY
+
+rm -rf "$OUT/test_batches"
+mkdir -p "$OUT/test_batches" "$OUT/test_answers" "$OUT/test_logs"
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+src = Path("/workdir/bt730192/CAD-Coder/freecad_dataset/json/test_eval.jsonl")
+out = Path("/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000/test_batches")
+
+rows = [json.loads(x) for x in src.read_text().splitlines() if x.strip()]
+
+assert len(rows) == 600
+
+for i in range(12):
+    batch = rows[i*50:(i+1)*50]
+    (out / f"batch_{i+1:02d}.jsonl").write_text(
+        "\n".join(json.dumps(x, ensure_ascii=False) for x in batch) + "\n"
+    )
+    print(f"batch_{i+1:02d}: {len(batch)}")
+
+print("TOTAL:", len(rows))
+PY
+
+cat > "$OUT/run_test_batch.sh" <<'SH'
+#!/bin/bash
+set -euo pipefail
+
+cd /workdir/bt730192/CAD-Coder
+
+PYTHON=/workdir/bt730192/conda/envs/llava/bin/python
+
+export DATA=/workdir/bt730192/CAD-Coder/freecad_dataset
+export IMAGES=$DATA/images
+export OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_macro_2000
+
+BATCH_ID="$1"
+
+if [ -z "$BATCH_ID" ]; then
+    echo "Usage: $0 BATCH_ID"
+    exit 1
+fi
+
+BATCH=$(printf "%02d" "$BATCH_ID")
+
+BATCH_FILE="$OUT/test_batches/batch_${BATCH}.jsonl"
+ANSWER_FILE="$OUT/test_answers/batch_${BATCH}_answers.jsonl"
+LOG_FILE="$OUT/test_logs/batch_${BATCH}.log"
+
+CKPT=$(find "$OUT" -maxdepth 1 -type d -name "checkpoint-*" | sort -V | tail -1)
+
+test -d "$CKPT"
+test -f "$BATCH_FILE"
+
+rm -f "$ANSWER_FILE"
+
+echo "Checkpoint: $CKPT"
+echo "Batch:      $BATCH_FILE"
+echo "Output:     $ANSWER_FILE"
+
+CUDA_VISIBLE_DEVICES=0 "$PYTHON" -m llava.eval.model_vqa_loader \
+    --model-path "$CKPT" \
+    --question-file "$BATCH_FILE" \
+    --image-folder "$IMAGES" \
+    --answers-file "$ANSWER_FILE" \
+    --temperature 0 \
+    --conv-mode llava_v1 \
+    --max_new_tokens 2048 \
+    2>&1 | tee "$LOG_FILE"
+
+test -f "$ANSWER_FILE"
+test "$(wc -l < "$ANSWER_FILE")" -eq 50
+
+echo "SUCCESS: batch $BATCH"
+SH
+
+chmod +x "$OUT/run_test_batch.sh"
+
+rm -f "$OUT/test_answers/batch_01_answers.jsonl"
+
+
+

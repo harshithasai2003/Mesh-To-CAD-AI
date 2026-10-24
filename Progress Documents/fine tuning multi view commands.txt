@@ -1,0 +1,1537 @@
+cd /workdir/bt730192/CAD-Coder
+conda activate /workdir/bt730192/conda/envs/llava
+
+export ROOT=/workdir/bt730192/CAD-Coder
+export FINAL=$ROOT/final_dataset
+export NEWCODE=$ROOT/CAD-Coder-multiview
+export OUT=$ROOT/checkpoints/freecad_multiview
+
+mkdir -p "$FINAL/images"
+mkdir -p "$FINAL/macros"
+mkdir -p "$FINAL/json"
+mkdir -p "$OUT"
+
+# OLD DATA/MODEL ARE NOT TOUCHED
+test -d "$ROOT/freecad_dataset" && echo "OLD DATA OK"
+test -d "$ROOT/checkpoints/freecad_macro_2000" && echo "OLD MODEL OK"
+
+# Fresh repository
+if [ ! -d "$NEWCODE" ]; then
+    git clone https://github.com/anniedoris/CAD-Coder.git "$NEWCODE"
+fi
+
+echo "NEW REPO: $NEWCODE"
+echo "NEW DATA: $FINAL"
+echo "NEW MODEL: $OUT"
+
+conda activate /workdir/bt730192/conda/envs/llava
+
+export ROOT=/workdir/bt730192/CAD-Coder
+export CODE=/workdir/bt730192/CAD-Coder/CAD-Coder-multiview
+export DATA=/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset
+export JSON=/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/json
+export IMAGES=/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/images
+export MACROS=/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/macros
+export BASE=/workdir/bt730192/cadcoder_data/models/CAD-Coder
+export OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_multiview
+export DEBUG_OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_multiview_debug
+
+cd "$CODE"
+
+cp -f llava/train/train.py.original llava/train/train.py
+cp -f llava/eval/model_vqa_loader.py.original llava/eval/model_vqa_loader.py
+
+python -m py_compile llava/train/train.py
+python -m py_compile llava/eval/model_vqa_loader.py
+
+echo "CLEAN RESTORE PASSED"
+
+cat > /tmp/fix_multiview_train.py <<'PY'
+from pathlib import Path
+import ast
+
+p = Path("/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/llava/train/train.py")
+s = p.read_text()
+
+def replace_node(source, node, replacement):
+    lines = source.splitlines(True)
+    start = sum(len(x) for x in lines[:node.lineno - 1])
+    end = sum(len(x) for x in lines[:node.end_lineno])
+    return source[:start] + replacement + source[end:]
+
+# ------------------------------------------------------------
+# preprocess_multimodal
+# ------------------------------------------------------------
+
+tree = ast.parse(s)
+
+node = next(
+    n for n in tree.body
+    if isinstance(n, ast.FunctionDef)
+    and n.name == "preprocess_multimodal"
+)
+
+new_function = '''def preprocess_multimodal(
+    sources: Sequence[str],
+    data_args: DataArguments
+) -> Dict:
+    is_multimodal = data_args.is_multimodal
+    if not is_multimodal:
+        return sources
+
+    for source in sources:
+        for sentence in source:
+            if DEFAULT_IMAGE_TOKEN in sentence["value"]:
+                num_image_tokens = sentence["value"].count(
+                    DEFAULT_IMAGE_TOKEN
+                )
+
+                sentence["value"] = sentence["value"].replace(
+                    DEFAULT_IMAGE_TOKEN, ""
+                ).strip()
+
+                sentence["value"] = (
+                    "\\n".join(
+                        [DEFAULT_IMAGE_TOKEN] * num_image_tokens
+                    )
+                    + "\\n"
+                    + sentence["value"]
+                ).strip()
+
+                if "mmtag" in conversation_lib.default_conversation.version:
+                    sentence["value"] = sentence["value"].replace(
+                        DEFAULT_IMAGE_TOKEN,
+                        "<Image>" + DEFAULT_IMAGE_TOKEN + "</Image>"
+                    )
+
+            replace_token = DEFAULT_IMAGE_TOKEN
+
+            if data_args.mm_use_im_start_end:
+                replace_token = (
+                    DEFAULT_IM_START_TOKEN
+                    + replace_token
+                    + DEFAULT_IM_END_TOKEN
+                )
+
+            sentence["value"] = sentence["value"].replace(
+                DEFAULT_IMAGE_TOKEN,
+                replace_token
+            )
+
+    return sources
+
+'''
+
+s = replace_node(s, node, new_function)
+
+# ------------------------------------------------------------
+# preprocess_v1
+# ------------------------------------------------------------
+
+tree = ast.parse(s)
+
+node = next(
+    n for n in tree.body
+    if isinstance(n, ast.FunctionDef)
+    and n.name == "preprocess_v1"
+)
+
+start = s.index("def preprocess_v1")
+end = s.index("\ndef preprocess_mpt", start)
+
+block = s[start:end]
+
+old = """                round_len = len(tokenizer_image_token(rou, tokenizer))
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
+"""
+
+new = """                round_len = len(tokenizer_image_token(rou, tokenizer))
+                num_image_tokens = parts[0].count(DEFAULT_IMAGE_TOKEN)
+                instruction_len = (
+                    len(tokenizer_image_token(parts[0], tokenizer))
+                    - (1 + num_image_tokens)
+                )
+"""
+
+if old not in block:
+    raise RuntimeError("preprocess_v1 target not found")
+
+block = block.replace(old, new, 1)
+s = s[:start] + block + s[end:]
+
+# ------------------------------------------------------------
+# LazySupervisedDataset
+# ------------------------------------------------------------
+
+tree = ast.parse(s)
+
+node = next(
+    n for n in tree.body
+    if isinstance(n, ast.ClassDef)
+    and n.name == "LazySupervisedDataset"
+)
+
+new_class = '''class LazySupervisedDataset(Dataset):
+    """Dataset for 5-view supervised fine-tuning."""
+
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer: transformers.PreTrainedTokenizer,
+        data_args: DataArguments
+    ):
+        super(LazySupervisedDataset, self).__init__()
+
+        with open(data_path, "r") as f:
+            self.list_data_dict = json.load(f)
+
+        rank0_print("Formatting inputs...Skip in lazy mode")
+
+        self.tokenizer = tokenizer
+        self.data_args = data_args
+
+    def __len__(self):
+        return len(self.list_data_dict)
+
+    @property
+    def lengths(self):
+        length_list = []
+
+        for sample in self.list_data_dict:
+            img_tokens = (
+                128 * len(sample["images"])
+                if "images" in sample
+                else 0
+            )
+
+            length_list.append(
+                sum(
+                    len(conv["value"].split())
+                    for conv in sample["conversations"]
+                ) + img_tokens
+            )
+
+        return length_list
+
+    @property
+    def modality_lengths(self):
+        length_list = []
+
+        for sample in self.list_data_dict:
+            cur_len = sum(
+                len(conv["value"].split())
+                for conv in sample["conversations"]
+            )
+
+            if "images" in sample:
+                cur_len = cur_len
+            else:
+                cur_len = -cur_len
+
+            length_list.append(cur_len)
+
+        return length_list
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+
+        sample = self.list_data_dict[i]
+
+        if "images" not in sample:
+            raise RuntimeError(
+                f"Sample {i} has no 'images' field."
+            )
+
+        image_files = sample["images"]
+
+        if len(image_files) != 5:
+            raise RuntimeError(
+                f"Sample {i} contains {len(image_files)} images; "
+                "exactly 5 are required."
+            )
+
+        image_folder = self.data_args.image_folder
+        processor = self.data_args.image_processor
+
+        images = []
+
+        for image_file in image_files:
+
+            image_path = os.path.join(
+                image_folder,
+                image_file
+            )
+
+            if not os.path.isfile(image_path):
+                raise FileNotFoundError(
+                    f"Missing image: {image_path}"
+                )
+
+            image = Image.open(
+                image_path
+            ).convert("RGB")
+
+            if self.data_args.image_aspect_ratio == "pad":
+
+                width, height = image.size
+
+                if width != height:
+
+                    background_color = tuple(
+                        int(x * 255)
+                        for x in processor.image_mean
+                    )
+
+                    if width > height:
+                        padded = Image.new(
+                            image.mode,
+                            (width, width),
+                            background_color
+                        )
+
+                        padded.paste(
+                            image,
+                            (0, (width - height) // 2)
+                        )
+
+                    else:
+                        padded = Image.new(
+                            image.mode,
+                            (height, height),
+                            background_color
+                        )
+
+                        padded.paste(
+                            image,
+                            ((height - width) // 2, 0)
+                        )
+
+                    image = padded
+
+            image = processor.preprocess(
+                image,
+                return_tensors="pt"
+            )["pixel_values"][0]
+
+            images.append(image)
+
+        images = torch.stack(images, dim=0)
+
+        if images.shape[0] != 5:
+            raise RuntimeError(
+                f"Expected 5 processed images, got "
+                f"{images.shape[0]}"
+            )
+
+        sources = preprocess_multimodal(
+            copy.deepcopy(
+                [sample["conversations"]]
+            ),
+            self.data_args
+        )
+
+        data_dict = preprocess(
+            sources,
+            self.tokenizer,
+            has_image=True
+        )
+
+        data_dict = {
+            "input_ids": data_dict["input_ids"][0],
+            "labels": data_dict["labels"][0],
+            "images": images
+        }
+
+        return data_dict
+
+'''
+
+s = replace_node(s, node, new_class)
+
+# ------------------------------------------------------------
+# DataCollator
+# ------------------------------------------------------------
+
+tree = ast.parse(s)
+
+node = next(
+    n for n in tree.body
+    if isinstance(n, ast.ClassDef)
+    and n.name == "DataCollatorForSupervisedDataset"
+)
+
+new_class = '''@dataclass
+class DataCollatorForSupervisedDataset(object):
+    """Collator for 5-view supervised fine-tuning."""
+
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(
+        self,
+        instances: Sequence[Dict]
+    ) -> Dict[str, torch.Tensor]:
+
+        input_ids, labels = tuple(
+            [
+                instance[key]
+                for instance in instances
+            ]
+            for key in ("input_ids", "labels")
+        )
+
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id
+        )
+
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels,
+            batch_first=True,
+            padding_value=IGNORE_INDEX
+        )
+
+        input_ids = input_ids[
+            :, :self.tokenizer.model_max_length
+        ]
+
+        labels = labels[
+            :, :self.tokenizer.model_max_length
+        ]
+
+        images = [
+            instance["images"]
+            for instance in instances
+        ]
+
+        for image_tensor in images:
+            if image_tensor.ndim != 4:
+                raise RuntimeError(
+                    "Expected image tensor [5,C,H,W]"
+                )
+
+            if image_tensor.shape[0] != 5:
+                raise RuntimeError(
+                    "Expected exactly 5 views per sample"
+                )
+
+        batch = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": input_ids.ne(
+                self.tokenizer.pad_token_id
+            ),
+            "images": torch.stack(images, dim=0)
+        }
+
+        return batch
+
+'''
+
+s = replace_node(s, node, new_class)
+
+ast.parse(s)
+p.write_text(s)
+
+print("TRAIN MULTIVIEW PATCH APPLIED")
+PY
+
+python /tmp/fix_multiview_train.py
+python -m py_compile "$CODE/llava/train/train.py"
+
+echo "TRAIN.PY COMPILE PASSED"
+
+python - <<'PY'
+import json
+import os
+
+root = "/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset"
+
+with open(root + "/json/train.json") as f:
+    train = json.load(f)
+
+with open(root + "/json/val.json") as f:
+    val = json.load(f)
+
+with open(root + "/json/test.json") as f:
+    test = json.load(f)
+
+assert len(train) == 1600
+assert len(val) == 200
+assert len(test) == 200
+
+for name, data in [
+    ("train", train),
+    ("val", val),
+    ("test", test)
+]:
+    for i, sample in enumerate(data):
+        assert len(sample["images"]) == 5
+
+        for image in sample["images"]:
+            path = os.path.join(
+                root,
+                "images",
+                image
+            )
+            assert os.path.isfile(path), path
+
+print("TRAIN OBJECTS :", len(train))
+print("VAL OBJECTS   :", len(val))
+print("TEST OBJECTS  :", len(test))
+print("TRAIN IMAGES  :", len(train) * 5)
+print("VAL IMAGES    :", len(val) * 5)
+print("TEST IMAGES   :", len(test) * 5)
+print("TOTAL IMAGES  :", (len(train)+len(val)+len(test))*5)
+print("DATASET CHECK PASSED")
+PY
+
+python - <<'PY'
+import json
+import torch
+import transformers
+
+from llava.train.train import (
+    LazySupervisedDataset,
+    DataCollatorForSupervisedDataset
+)
+
+json_path = "/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/json/debug_train.json"
+image_folder = "/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/images"
+
+tokenizer = transformers.AutoTokenizer.from_pretrained(
+    "/workdir/bt730192/cadcoder_data/models/CAD-Coder",
+    use_fast=False
+)
+
+from types import SimpleNamespace
+
+data_args = SimpleNamespace(
+    image_folder=image_folder,
+    image_processor=None,
+    image_aspect_ratio="pad",
+    is_multimodal=True,
+    mm_use_im_start_end=False
+)
+
+print("LOADER MODULE IMPORT PASSED")
+PY
+
+python - <<'PY'
+import json
+
+src = "/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/json/train.json"
+dst = "/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/json/debug_train.json"
+
+with open(src) as f:
+    data = json.load(f)
+
+with open(dst, "w") as f:
+    json.dump(data[:20], f, indent=2)
+
+assert len(data[:20]) == 20
+
+print("DEBUG OBJECTS :", 20)
+print("DEBUG IMAGES  :", 100)
+print("DEBUG DATASET CREATED")
+PY
+
+rm -rf "$DEBUG_OUT"
+mkdir -p "$DEBUG_OUT"
+
+cd "$CODE"
+
+CUDA_VISIBLE_DEVICES=0 python -m llava.train.train_mem \
+  --model_name_or_path "$BASE" \
+  --version v1 \
+  --data_path "$JSON/debug_train.json" \
+  --image_folder "$IMAGES" \
+  --vision_tower openai/clip-vit-large-patch14-336 \
+  --mm_projector_type mlp2x_gelu \
+  --mm_use_im_start_end False \
+  --mm_use_im_patch_token False \
+  --image_aspect_ratio pad \
+  --lazy_preprocess True \
+  --output_dir "$DEBUG_OUT" \
+  --lora_enable True \
+  --lora_r 128 \
+  --lora_alpha 256 \
+  --lora_dropout 0.05 \
+  --bf16 True \
+  --tf32 True \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 4 \
+  --learning_rate 1e-5 \
+  --num_train_epochs 1 \
+  --warmup_ratio 0.05 \
+  --lr_scheduler_type cosine \
+  --weight_decay 0.0 \
+  --gradient_checkpointing True \
+  --model_max_length 4096 \
+  --save_strategy epoch \
+  --save_total_limit 1 \
+  --logging_steps 1 \
+  --report_to none \
+  2>&1 | tee "$DEBUG_OUT/training.log"
+
+cd /workdir/bt730192/CAD-Coder/CAD-Coder-multiview
+
+export JSON=/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/json
+export IMAGES=/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/images
+
+python - <<'PY'
+import json
+import os
+import shutil
+
+JSON = os.environ["JSON"]
+IMAGES = os.environ["IMAGES"]
+
+src = os.path.join(JSON, "train.json")
+out = os.path.join(JSON, "debug_train.json")
+
+with open(src, "r") as f:
+    data = json.load(f)
+
+if len(data) < 20:
+    raise RuntimeError(f"train.json contains only {len(data)} records")
+
+debug = data[:20]
+
+if len(debug) != 20:
+    raise RuntimeError("Failed to select exactly 20 objects")
+
+for i, item in enumerate(debug):
+    images = item.get("images")
+
+    if not isinstance(images, list):
+        raise RuntimeError(f"Sample {i} has no 'images' list")
+
+    if len(images) != 5:
+        raise RuntimeError(
+            f"Sample {i} has {len(images)} images; expected exactly 5"
+        )
+
+    for image in images:
+        path = os.path.join(IMAGES, image)
+        if not os.path.isfile(path):
+            raise RuntimeError(f"Missing image: {path}")
+
+with open(out, "w") as f:
+    json.dump(debug, f, indent=2)
+
+print(f"Created: {out}")
+print(f"Objects: {len(debug)}")
+print(f"Views/object: 5")
+print(f"Total images referenced: {len(debug) * 5}")
+
+# Final validation
+with open(out, "r") as f:
+    check = json.load(f)
+
+assert len(check) == 20
+
+total = 0
+for item in check:
+    assert len(item["images"]) == 5
+    total += len(item["images"])
+
+assert total == 100
+
+print("DEBUG DATASET VALIDATION PASSED")
+print("20 objects")
+print("100 images")
+print("5 views per object")
+PY
+
+
+python - <<'PY'
+import json
+import os
+
+p = "/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/json/debug_train.json"
+img = "/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/images"
+
+with open(p) as f:
+    data = json.load(f)
+
+assert len(data) == 20
+
+for n, x in enumerate(data):
+    assert len(x["images"]) == 5, (n, x["images"])
+    for f in x["images"]:
+        assert os.path.isfile(os.path.join(img, f)), f
+
+print("FINAL DEBUG CHECK PASSED")
+print("records =", len(data))
+print("images =", sum(len(x["images"]) for x in data))
+PY
+
+cd /workdir/bt730192/CAD-Coder/CAD-Coder-multiview
+
+cp -f llava/model/llava_arch.py llava/model/llava_arch.py.before_multiview_fix
+
+python - <<'PY'
+from pathlib import Path
+
+p = Path("llava/model/llava_arch.py")
+s = p.read_text()
+
+old = """            image_features = torch.split(image_features, split_sizes, dim=0)
+            mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
+"""
+
+new = """            image_features = torch.split(image_features, split_sizes, dim=0)
+
+            # Multiview: each input image must correspond to one <image> token.
+            # Convert each sample's [N_views, patches, hidden] tensor into
+            # N_views separate feature entries.
+            image_features = [
+                image_features_per_sample[i:i+1]
+                for image_features_per_sample in image_features
+                for i in range(image_features_per_sample.shape[0])
+            ]
+
+            mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
+"""
+
+if old not in s:
+    raise RuntimeError("PATCH FAILED: expected architecture block not found")
+
+s = s.replace(old, new, 1)
+p.write_text(s)
+
+print("ARCHITECTURE PATCH APPLIED")
+PY
+
+python -m py_compile llava/model/llava_arch.py
+
+echo "ARCHITECTURE COMPILE PASSED"
+
+python - <<'PY'
+import torch
+
+B = 1
+V = 5
+P = 577
+H = 4096
+
+fake_features = torch.randn(B * V, P, H)
+
+split_sizes = [V] * B
+features = torch.split(fake_features, split_sizes, dim=0)
+
+features = [
+    x[i:i+1]
+    for x in features
+    for i in range(x.shape[0])
+]
+
+assert len(features) == 5
+assert all(x.shape == (1, P, H) for x in features)
+
+features = [x.flatten(0, 1) for x in features]
+
+assert len(features) == 5
+assert all(x.shape == (P, H) for x in features)
+
+print("MULTIVIEW FEATURE TEST PASSED")
+print("feature entries:", len(features))
+print("feature shape:", tuple(features[0].shape))
+PY
+
+export BASE=/workdir/bt730192/cadcoder_data/models/CAD-Coder
+export JSON=/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/json
+export IMAGES=/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/images
+export DEBUG_OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_multiview_debug
+
+rm -rf "$DEBUG_OUT"
+mkdir -p "$DEBUG_OUT"
+
+CUDA_VISIBLE_DEVICES=0 python -m llava.train.train_mem \
+  --model_name_or_path "$BASE" \
+  --version v1 \
+  --data_path "$JSON/debug_train.json" \
+  --image_folder "$IMAGES" \
+  --vision_tower openai/clip-vit-large-patch14-336 \
+  --mm_projector_type mlp2x_gelu \
+  --mm_use_im_start_end False \
+  --mm_use_im_patch_token False \
+  --image_aspect_ratio pad \
+  --lazy_preprocess True \
+  --output_dir "$DEBUG_OUT" \
+  --lora_enable True \
+  --lora_r 128 \
+  --lora_alpha 256 \
+  --lora_dropout 0.05 \
+  --bf16 True \
+  --tf32 True \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 4 \
+  --learning_rate 1e-5 \
+  --num_train_epochs 1 \
+  --warmup_ratio 0.05 \
+  --lr_scheduler_type cosine \
+  --weight_decay 0.0 \
+  --gradient_checkpointing True \
+  --model_max_length 4096 \
+  --save_strategy epoch \
+  --save_total_limit 1 \
+  --logging_steps 1 \
+  --report_to none \
+  2>&1 | tee "$DEBUG_OUT/training.log"
+
+
+
+test -f "$DEBUG_OUT/training.log" || exit 1
+
+grep -E "Traceback|IndexError|RuntimeError|ValueError|CUDA error|loss" \
+    "$DEBUG_OUT/training.log" | tail -30
+
+find "$DEBUG_OUT" -maxdepth 1 -type d -name "checkpoint-*" -print
+
+
+
+python - <<'PY'
+import json, os
+
+base = "/workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset"
+imgdir = os.path.join(base, "images")
+
+for name, expected in [("train.json",1600),("val.json",200),("test.json",200)]:
+    path = os.path.join(base, "json", name)
+
+    with open(path) as f:
+        data = json.load(f)
+
+    assert len(data) == expected, (name, len(data))
+
+    for i, x in enumerate(data):
+        assert len(x["images"]) == 5, (name, i)
+        for im in x["images"]:
+            assert os.path.isfile(os.path.join(imgdir, im)), im
+
+    print(name, "OK:", len(data), "objects,", len(data)*5, "images")
+
+print("FULL DATASET VALIDATION PASSED")
+PY
+
+export OUT=/workdir/bt730192/CAD-Coder/checkpoints/freecad_multiview
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+CUDA_VISIBLE_DEVICES=0 python -m llava.train.train_mem \
+  --model_name_or_path "$BASE" \
+  --version v1 \
+  --data_path "$JSON/train.json" \
+  --image_folder "$IMAGES" \
+  --vision_tower openai/clip-vit-large-patch14-336 \
+  --mm_projector_type mlp2x_gelu \
+  --mm_use_im_start_end False \
+  --mm_use_im_patch_token False \
+  --image_aspect_ratio pad \
+  --lazy_preprocess True \
+  --output_dir "$OUT" \
+  --lora_enable True \
+  --lora_r 128 \
+  --lora_alpha 256 \
+  --lora_dropout 0.05 \
+  --bf16 True \
+  --tf32 True \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 16 \
+  --learning_rate 1e-5 \
+  --num_train_epochs 5 \
+  --warmup_ratio 0.05 \
+  --lr_scheduler_type cosine \
+  --weight_decay 0.0 \
+  --gradient_checkpointing True \
+  --model_max_length 4096 \
+  --save_strategy epoch \
+  --save_total_limit 5 \
+  --logging_steps 10 \
+  --report_to none \
+  2>&1 | tee "$OUT/training.log"
+
+
+
+cd /workdir/bt730192/CAD-Coder
+ls -lah checkpoints/freecad_multiview/
+find checkpoints/freecad_multiview -maxdepth 1 -type d -name "checkpoint-*" | sort -V | tail
+tail -50 checkpoints/freecad_multiview/training.log
+
+cd /workdir/bt730192/CAD-Coder/CAD-Coder-multiview
+
+wc -l freecad_dataset/json/test.jsonl
+
+python - <<'PY'
+import json
+
+p = "freecad_dataset/json/test.jsonl"
+with open(p) as f:
+    rows = [json.loads(x) for x in f]
+
+print("samples:", len(rows))
+print("views per sample:", sorted(set(len(x["images"]) for x in rows)))
+PY
+
+
+cd /workdir/bt730192/CAD-Coder/CAD-Coder-multiview
+find . -maxdepth 3 -type f -name "*.py" | grep -E "infer|test|eval"
+cd /workdir/bt730192/CAD-Coder
+find checkpoints/freecad_multiview -maxdepth 1 -type d -name "checkpoint-*" | sort -V | tail -1
+ls -lh checkpoints/freecad_multiview/checkpoint-500/
+sed -n '1,260p' PATH_TO_YOUR_INFERENCE_SCRIPT.py
+cd /workdir/bt730192/CAD-Coder/CAD-Coder-multiview
+
+cp llava/eval/model_vqa_loader.py llava/eval/model_vqa_loader.py.singleview.bak
+cat > llava/eval/model_vqa_loader.py <<'PY'
+import argparse
+import torch
+import os
+import json
+from tqdm import tqdm
+import shortuuid
+import math
+
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.conversation import conv_templates
+from llava.model.builder import load_pretrained_model
+from llava.utils import disable_torch_init
+from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+
+
+def split_list(lst, n):
+    chunk_size = math.ceil(len(lst) / n)
+    return [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
+
+
+def get_chunk(lst, n, k):
+    chunks = split_list(lst, n)
+    return chunks[k]
+
+
+class CustomDataset(Dataset):
+    def __init__(self, questions, image_folder, tokenizer, image_processor, model_config):
+        self.questions = questions
+        self.image_folder = image_folder
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.model_config = model_config
+
+    def __getitem__(self, index):
+        line = self.questions[index]
+
+        image_files = line["images"]
+        qs = line["text"]
+
+        if len(image_files) != 5:
+            raise ValueError(
+                f"Expected 5 images for question {line['question_id']}, "
+                f"got {len(image_files)}"
+            )
+
+        image_tokens = "\n".join([DEFAULT_IMAGE_TOKEN] * 5)
+
+        if self.model_config.mm_use_im_start_end:
+            qs = (
+                "\n".join(
+                    [DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN]
+                    * 5
+                )
+                + "\n"
+                + qs
+            )
+        else:
+            qs = image_tokens + "\n" + qs
+
+        conv = conv_templates[args.conv_mode].copy()
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        images = []
+        image_sizes = []
+
+        for image_file in image_files:
+            image = Image.open(
+                os.path.join(self.image_folder, image_file)
+            ).convert("RGB")
+
+            images.append(image)
+            image_sizes.append(image.size)
+
+        image_tensor = process_images(
+            images,
+            self.image_processor,
+            self.model_config
+        )
+
+        input_ids = tokenizer_image_token(
+            prompt,
+            self.tokenizer,
+            IMAGE_TOKEN_INDEX,
+            return_tensors="pt"
+        )
+
+        return input_ids, image_tensor, image_sizes
+
+    def __len__(self):
+        return len(self.questions)
+
+
+def collate_fn(batch):
+    input_ids, image_tensors, image_sizes = zip(*batch)
+
+    input_ids = torch.stack(input_ids, dim=0)
+
+    # batch_size is 1, so preserve [5, 3, H, W]
+    image_tensors = torch.stack(image_tensors, dim=0)
+
+    return input_ids, image_tensors, image_sizes
+
+
+def create_data_loader(
+    questions,
+    image_folder,
+    tokenizer,
+    image_processor,
+    model_config,
+    batch_size=1,
+    num_workers=0
+):
+    assert batch_size == 1, "batch_size must be 1"
+
+    dataset = CustomDataset(
+        questions,
+        image_folder,
+        tokenizer,
+        image_processor,
+        model_config
+    )
+
+    data_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=False,
+        collate_fn=collate_fn
+    )
+
+    return data_loader
+
+
+def eval_model(args):
+    disable_torch_init()
+
+    model_path = os.path.expanduser(args.model_path)
+    model_name = get_model_name_from_path(model_path)
+
+    tokenizer, model, image_processor, context_len = load_pretrained_model(
+        model_path,
+        args.model_base,
+        model_name
+    )
+
+    questions = [
+        json.loads(q)
+        for q in open(os.path.expanduser(args.question_file), "r")
+    ]
+
+    questions = get_chunk(
+        questions,
+        args.num_chunks,
+        args.chunk_idx
+    )
+
+    answers_file = os.path.expanduser(args.answers_file)
+    os.makedirs(os.path.dirname(answers_file), exist_ok=True)
+
+    ans_file = open(answers_file, "w")
+
+    data_loader = create_data_loader(
+        questions,
+        args.image_folder,
+        tokenizer,
+        image_processor,
+        model.config,
+        batch_size=1,
+        num_workers=0
+    )
+
+    for (input_ids, image_tensor, image_sizes), line in tqdm(
+        zip(data_loader, questions),
+        total=len(questions)
+    ):
+        idx = line["question_id"]
+        cur_prompt = line["text"]
+
+        input_ids = input_ids.to(
+            device="cuda",
+            non_blocking=True
+        )
+
+        image_tensor = image_tensor.to(
+            dtype=torch.float16,
+            device="cuda",
+            non_blocking=True
+        )
+
+        with torch.inference_mode():
+            output_ids = model.generate(
+                input_ids,
+                images=image_tensor,
+                image_sizes=image_sizes,
+                do_sample=True if args.temperature > 0 else False,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                num_beams=args.num_beams,
+                max_new_tokens=args.max_new_tokens,
+                use_cache=True
+            )
+
+        outputs = tokenizer.batch_decode(
+            output_ids,
+            skip_special_tokens=True
+        )[0].strip()
+
+        ans_id = shortuuid.uuid()
+
+        ans_file.write(
+            json.dumps({
+                "question_id": idx,
+                "prompt": cur_prompt,
+                "text": outputs,
+                "answer_id": ans_id,
+                "model_id": model_name,
+                "metadata": {}
+            }) + "\n"
+        )
+
+        ans_file.flush()
+
+    ans_file.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--model-path", type=str, required=True)
+    parser.add_argument("--model-base", type=str, default=None)
+    parser.add_argument("--image-folder", type=str, required=True)
+    parser.add_argument("--question-file", type=str, required=True)
+    parser.add_argument("--answers-file", type=str, required=True)
+    parser.add_argument("--conv-mode", type=str, default="llava_v1")
+    parser.add_argument("--num-chunks", type=int, default=1)
+    parser.add_argument("--chunk-idx", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
+
+    args = parser.parse_args()
+
+    eval_model(args)
+PY
+
+
+
+cd /workdir/bt730192/CAD-Coder/CAD-Coder-multiview
+
+cp llava/eval/model_vqa_loader.py llava/eval/model_vqa_loader.py.backup
+
+cat > llava/eval/model_vqa_loader.py <<'PY'
+import argparse
+import json
+import os
+
+import torch
+from tqdm import tqdm
+
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from llava.conversation import conv_templates
+from llava.mm_utils import (
+    get_model_name_from_path,
+    process_images,
+    tokenizer_image_token,
+)
+from llava.model.builder import load_pretrained_model
+from PIL import Image
+
+
+def load_jsonl(path):
+    with open(path, "r") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def eval_model(args):
+    model_path = os.path.expanduser(args.model_path)
+
+    tokenizer, model, image_processor, context_len = load_pretrained_model(
+        model_path,
+        args.model_base,
+        get_model_name_from_path(model_path),
+    )
+
+    model.eval()
+
+    data = load_jsonl(args.question_file)
+
+    os.makedirs(os.path.dirname(args.answers_file), exist_ok=True)
+
+    with open(args.answers_file, "w") as ans_file:
+
+        for line in tqdm(data):
+
+            question_id = line.get(
+                "question_id",
+                f"sample_{data.index(line):04d}"
+            )
+
+            image_files = line["images"]
+
+            if len(image_files) != 5:
+                raise ValueError(
+                    f"{question_id}: expected exactly 5 images, "
+                    f"found {len(image_files)}"
+                )
+
+            # ---------------------------------------------------------
+            # Load all five views independently.
+            # IMPORTANT: keep these as a LIST of tensors.
+            # Do NOT torch.stack() them into a 5-D tensor.
+            # ---------------------------------------------------------
+            pil_images = []
+
+            for image_file in image_files:
+                image_path = os.path.join(
+                    args.image_folder,
+                    image_file
+                )
+
+                if not os.path.isfile(image_path):
+                    raise FileNotFoundError(
+                        f"Image not found: {image_path}"
+                    )
+
+                image = Image.open(image_path).convert("RGB")
+                pil_images.append(image)
+
+            image_tensors = process_images(
+                pil_images,
+                image_processor,
+                model.config
+            )
+
+            # process_images() should return one tensor per image.
+            if len(image_tensors) != 5:
+                raise RuntimeError(
+                    f"{question_id}: process_images returned "
+                    f"{len(image_tensors)} tensors instead of 5"
+                )
+
+            # ---------------------------------------------------------
+            # Keep image tensors as a LIST.
+            # This is critical for CAD-Coder's multimodal architecture.
+            # ---------------------------------------------------------
+            image_tensors = [
+                image_tensor.to(
+                    device=model.device,
+                    dtype=model.dtype
+                )
+                for image_tensor in image_tensors
+            ]
+
+            # ---------------------------------------------------------
+            # Build exactly five image tokens.
+            # ---------------------------------------------------------
+            prompt = line["text"]
+
+            if prompt.count(DEFAULT_IMAGE_TOKEN) != 5:
+                prompt = (
+                    DEFAULT_IMAGE_TOKEN + "\n" +
+                    DEFAULT_IMAGE_TOKEN + "\n" +
+                    DEFAULT_IMAGE_TOKEN + "\n" +
+                    DEFAULT_IMAGE_TOKEN + "\n" +
+                    DEFAULT_IMAGE_TOKEN + "\n" +
+                    prompt
+                )
+
+            conv = conv_templates[args.conv_mode].copy()
+            conv.append_message(conv.roles[0], prompt)
+            conv.append_message(conv.roles[1], None)
+
+            final_prompt = conv.get_prompt()
+
+            input_ids = tokenizer_image_token(
+                final_prompt,
+                tokenizer,
+                IMAGE_TOKEN_INDEX,
+                return_tensors="pt",
+            ).unsqueeze(0).to(model.device)
+
+            # ---------------------------------------------------------
+            # Generate.
+            #
+            # IMPORTANT:
+            # images=image_tensors
+            #
+            # NOT:
+            # images=torch.stack(image_tensors)
+            # ---------------------------------------------------------
+            with torch.inference_mode():
+                output_ids = model.generate(
+                    input_ids,
+                    images=image_tensors,
+                    image_sizes=[
+                        image.size for image in pil_images
+                    ],
+                    do_sample=False,
+                    temperature=0,
+                    max_new_tokens=args.max_new_tokens,
+                    use_cache=True,
+                )
+
+            input_token_len = input_ids.shape[1]
+
+            output_text = tokenizer.batch_decode(
+                output_ids[:, input_token_len:],
+                skip_special_tokens=True,
+            )[0].strip()
+
+            ans_file.write(
+                json.dumps(
+                    {
+                        "question_id": question_id,
+                        "prompt": prompt,
+                        "text": output_text,
+                        "model_id": get_model_name_from_path(model_path),
+                    }
+                )
+                + "\n"
+            )
+
+            ans_file.flush()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--model-base",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--image-folder",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--question-file",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--answers-file",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--conv-mode",
+        type=str,
+        default="llava_v1",
+    )
+
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+    )
+
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=1024,
+    )
+
+    args = parser.parse_args()
+
+    eval_model(args)
+PY
+
+
+python -m py_compile llava/eval/model_vqa_loader.py
+
+python - <<'PY'
+import json
+
+p = "freecad_dataset/json/test_one.jsonl"
+
+with open(p) as f:
+    row = json.loads(f.readline())
+
+assert "question_id" in row
+assert "images" in row
+assert len(row["images"]) == 5
+assert "text" in row
+
+print("INPUT CHECK PASSED")
+print("question_id:", row["question_id"])
+print("views:", len(row["images"]))
+print("images:")
+for x in row["images"]:
+    print(" ", x)
+PY
+
+mkdir -p inference
+
+rm -f inference/test_one_answers.jsonl
+
+python -m llava.eval.model_vqa_loader \
+  --model-path /workdir/bt730192/CAD-Coder/checkpoints/freecad_multiview/checkpoint-500 \
+  --image-folder /workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/images \
+  --question-file /workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/json/test_one.jsonl \
+  --answers-file /workdir/bt730192/CAD-Coder/CAD-Coder-multiview/inference/test_one_answers.jsonl \
+  --conv-mode llava_v1 \
+  --temperature 0 \
+  --max_new_tokens 1024
+
+
+wc -l inference/test_one_answers.jsonl
+python - <<'PY'
+import json
+
+p = "inference/test_one_answers.jsonl"
+
+with open(p) as f:
+    row = json.loads(f.readline())
+
+print("\nQUESTION ID:")
+print(row["question_id"])
+
+print("\nGENERATED CAD CODE:")
+print(row["text"])
+PY
+
+
+
+cd /workdir/bt730192/CAD-Coder/CAD-Coder-multiview
+
+rm -f inference/test_answers.jsonl
+
+python -m llava.eval.model_vqa_loader \
+  --model-path /workdir/bt730192/CAD-Coder/checkpoints/freecad_multiview/checkpoint-500 \
+  --image-folder /workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/images \
+  --question-file /workdir/bt730192/CAD-Coder/CAD-Coder-multiview/freecad_dataset/json/test_fixed.jsonl \
+  --answers-file /workdir/bt730192/CAD-Coder/CAD-Coder-multiview/inference/test_answers.jsonl \
+  --conv-mode llava_v1 \
+  --temperature 0 \
+  --max_new_tokens 2048
+
+wc -l inference/test_answers.jsonl
+
+python - <<'PY'
+import json
+
+p = "inference/test_answers.jsonl"
+
+rows = []
+with open(p) as f:
+    for line in f:
+        if line.strip():
+            rows.append(json.loads(line))
+
+print("samples:", len(rows))
+print("empty:", sum(not r.get("text","").strip() for r in rows))
+
+assert len(rows) == 200
+assert all(r.get("text","").strip() for r in rows)
+
+print("INFERENCE OUTPUT VALIDATION PASSED")
+PY
+
+mkdir -p inference/generated_macros
+python - <<'PY'
+import json
+import os
+
+src = "inference/test_answers.jsonl"
+dst = "inference/generated_macros"
+
+with open(src) as f:
+    rows = [json.loads(x) for x in f if x.strip()]
+
+for i, row in enumerate(rows):
+    qid = row["question_id"]
+    text = row["text"].strip()
+
+    # Remove markdown code fences if the model produced them.
+    if text.startswith("```"):
+        lines = text.splitlines()
+
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        text = "\n".join(lines).strip()
+
+    path = os.path.join(dst, f"{qid}.py")
+
+    with open(path, "w") as f:
+        f.write(text + "\n")
+
+print("Generated macros:", len(rows))
+print("Directory:", dst)
+PY
+
+python - <<'PY'
+import os
+import py_compile
+
+d = "inference/generated_macros"
+
+files = sorted(
+    f for f in os.listdir(d)
+    if f.endswith(".py")
+)
+
+ok = 0
+bad = []
+
+for f in files:
+    path = os.path.join(d, f)
+
+    try:
+        py_compile.compile(
+            path,
+            doraise=True
+        )
+        ok += 1
+    except Exception as e:
+        bad.append((f, str(e)))
+
+print("Total:", len(files))
+print("Python syntax OK:", ok)
+print("Python syntax BAD:", len(bad))
+
+for f, e in bad[:20]:
+    print("\nBAD:", f)
+    print(e)
+PY
+
+

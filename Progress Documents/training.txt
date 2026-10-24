@@ -1,0 +1,435 @@
+conda activate llava
+
+
+Optional only to freeze the environment:-
+conda env export > cadcoder_2000_environment.yml
+pip freeze > cadcoder_2000_pip_freeze.txt
+
+mkdir -p freecad_dataset/images
+mkdir -p freecad_dataset/macros
+mkdir -p freecad_dataset/fcstd
+mkdir -p freecad_dataset/jsonl
+mkdir -p checkpoints/freecad_macro_2000
+mkdir -p evaluation/freecad_macro_2000
+
+nano make_variant_split.py
+
+import json
+import re
+from pathlib import Path
+
+ROOT = Path("freecad_dataset")
+
+IMAGE_DIR = ROOT / "images"
+MACRO_DIR = ROOT / "macros"
+FCSTD_DIR = ROOT / "fcstd"
+JSONL_DIR = ROOT / "jsonl"
+
+JSONL_DIR.mkdir(parents=True, exist_ok=True)
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+
+pattern = re.compile(r"^(.+)_([0-9]{3})$")
+
+samples = []
+
+for image_path in sorted(IMAGE_DIR.iterdir()):
+
+    if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+        continue
+
+    match = pattern.match(image_path.stem)
+
+    if match is None:
+        raise ValueError(
+            f"Bad filename format: {image_path.name}. "
+            f"Expected something like 10_001.png"
+        )
+
+    base_id = match.group(1)
+    variant = int(match.group(2))
+    sample_id = image_path.stem
+
+    if variant < 1 or variant > 100:
+        raise ValueError(
+            f"Variant outside 001-100: {image_path.name}"
+        )
+
+    # --------------------------------------------------
+    # Macro
+    # --------------------------------------------------
+
+    macro_path = MACRO_DIR / f"{sample_id}.py"
+
+    if not macro_path.exists():
+        raise FileNotFoundError(
+            f"Missing macro: {macro_path}"
+        )
+
+    # --------------------------------------------------
+    # FCStd
+    # Accept BOTH .FCStd and .fcstd
+    # --------------------------------------------------
+
+    fcstd_candidates = [
+        FCSTD_DIR / f"{sample_id}.FCStd",
+        FCSTD_DIR / f"{sample_id}.fcstd",
+    ]
+
+    fcstd_path = None
+
+    for candidate in fcstd_candidates:
+        if candidate.exists():
+            fcstd_path = candidate
+            break
+
+    if fcstd_path is None:
+        raise FileNotFoundError(
+            f"Missing FCStd for {sample_id}. "
+            f"Expected either {sample_id}.FCStd "
+            f"or {sample_id}.fcstd"
+        )
+
+    # --------------------------------------------------
+    # Read macro
+    # --------------------------------------------------
+
+    macro_text = macro_path.read_text(
+        encoding="utf-8"
+    ).strip()
+
+    if not macro_text:
+        raise ValueError(
+            f"Empty macro: {macro_path}"
+        )
+
+    # --------------------------------------------------
+    # Dataset record
+    # --------------------------------------------------
+
+    record = {
+        "id": sample_id,
+        "image": image_path.name,
+        "fcstd": fcstd_path.name,
+        "base_id": base_id,
+        "variant": variant,
+
+        "conversations": [
+            {
+                "from": "human",
+                "value":
+                    "<image>\n"
+                    "Generate the FreeCAD Python macro "
+                    "for this CAD model."
+            },
+            {
+                "from": "gpt",
+                "value": macro_text
+            }
+        ]
+    }
+
+    samples.append(record)
+
+
+# ======================================================
+# SPLIT
+#
+# 001-060 = TRAIN
+# 061-080 = VALIDATION
+# 081-100 = TEST
+# ======================================================
+
+train = []
+validation = []
+test = []
+
+for sample in samples:
+
+    variant = sample["variant"]
+
+    if 1 <= variant <= 60:
+        train.append(sample)
+
+    elif 61 <= variant <= 80:
+        validation.append(sample)
+
+    elif 81 <= variant <= 100:
+        test.append(sample)
+
+
+# ======================================================
+# SORT
+# ======================================================
+
+def sort_key(x):
+    return (
+        x["base_id"],
+        x["variant"]
+    )
+
+
+train.sort(key=sort_key)
+validation.sort(key=sort_key)
+test.sort(key=sort_key)
+
+
+# ======================================================
+# WRITE JSONL
+# ======================================================
+
+def write_jsonl(path, records):
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        for record in records:
+
+            f.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False
+                )
+                + "\n"
+            )
+
+
+write_jsonl(
+    JSONL_DIR / "train.jsonl",
+    train
+)
+
+write_jsonl(
+    JSONL_DIR / "validation.jsonl",
+    validation
+)
+
+write_jsonl(
+    JSONL_DIR / "test.jsonl",
+    test
+)
+
+
+# ======================================================
+# FINAL CHECKS
+# ======================================================
+
+print()
+print("======================================")
+print("DATASET CREATED")
+print("======================================")
+print(f"Total      : {len(samples)}")
+print(f"Train      : {len(train)}")
+print(f"Validation : {len(validation)}")
+print(f"Test       : {len(test)}")
+print("======================================")
+
+if len(samples) != 2000:
+    raise RuntimeError(
+        f"Expected exactly 2000 samples, "
+        f"found {len(samples)}"
+    )
+
+if len(train) != 1200:
+    raise RuntimeError(
+        f"Expected 1200 training samples, "
+        f"found {len(train)}"
+    )
+
+if len(validation) != 400:
+    raise RuntimeError(
+        f"Expected 400 validation samples, "
+        f"found {len(validation)}"
+    )
+
+if len(test) != 400:
+    raise RuntimeError(
+        f"Expected 400 test samples, "
+        f"found {len(test)}"
+    )
+
+print()
+print("EXPECTED SPLIT:")
+print("001-060 -> TRAIN")
+print("061-080 -> VALIDATION")
+print("081-100 -> TEST")
+print()
+print("SPLIT CHECK PASSED")
+
+python make_variant_split.py
+
+wc -l freecad_dataset/jsonl/*.jsonl
+
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("freecad_dataset/jsonl")
+
+for split in ["train", "validation", "test"]:
+
+    records = []
+
+    with open(root / f"{split}.jsonl", encoding="utf-8") as f:
+        for line in f:
+            records.append(json.loads(line))
+
+    variants = [x["variant"] for x in records]
+
+    print(
+        split,
+        "count =", len(records),
+        "min =", min(variants),
+        "max =", max(variants)
+    )
+
+    if split == "train":
+        assert min(variants) >= 1
+        assert max(variants) <= 60
+
+    elif split == "validation":
+        assert min(variants) >= 61
+        assert max(variants) <= 80
+
+    else:
+        assert min(variants) >= 81
+        assert max(variants) <= 100
+
+print("VARIANT RANGE CHECK PASSED")
+PY
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("freecad_dataset/jsonl")
+
+sets = {}
+
+for split in ["train", "validation", "test"]:
+
+    with open(root / f"{split}.jsonl", encoding="utf-8") as f:
+        sets[split] = {
+            json.loads(line)["id"]
+            for line in f
+        }
+
+assert not sets["train"] & sets["validation"]
+assert not sets["train"] & sets["test"]
+assert not sets["validation"] & sets["test"]
+
+print("NO ID OVERLAP")
+print("DATASET SPLIT IS CLEAN")
+PY
+
+python -m compileall -q freecad_dataset/macros
+
+export BASE_MODEL=/workdir/bt730491/cadcoder_data/models/CAD-Coder
+export DATASET=/workdir/bt730491/CAD-Coder/freecad_dataset
+export OUTPUT=/workdir/bt730491/CAD-Coder/checkpoints/freecad_macro_2000
+
+echo $BASE_MODEL
+echo $DATASET
+echo $OUTPUT
+
+sed -n '858,905p' llava/train/train.py
+python -m py_compile llava/train/train.py
+python llava/train/train_mem.py --help 2>/dev/null | grep -E -- \
+"--model_name_or_path|--data_path|--image_folder|--output_dir|--lora_enable|--lora_weight_path|--lora_r|--lora_alpha|--num_train_epochs|--learning_rate|--save_strategy"
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+
+cd /workdir/bt730491/CAD-Coder
+conda activate /workdir/bt730192/conda/envs/llava
+
+export BASE=/workdir/bt730491/cadcoder_data/models/CAD-Coder
+export PREV=/workdir/bt730491/cadcoder_data/finetuned_freecad
+export DATA=/workdir/bt730491/CAD-Coder/freecad_dataset
+export OUT=/workdir/bt730491/CAD-Coder/checkpoints/freecad_macro_2000
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+export WANDB_DISABLED=true
+export WANDB_MODE=disabledcd /workdir/bt730491/CAD-Coder
+
+cp llava/train/train.py llava/train/train.py.before_image_processor_fix
+sed -n '900,965p' llava/train/train.py
+
+applying patch
+
+python - <<'PY'
+from pathlib import Path
+
+p = Path("llava/train/train.py")
+s = p.read_text()
+
+marker = "    data_module = make_supervised_data_module(tokenizer=tokenizer,"
+assignment = "    data_args.image_processor = image_processor\n"
+
+if assignment in s:
+    print("image_processor assignment already exists; no change needed.")
+elif marker not in s:
+    raise SystemExit("ERROR: could not find make_supervised_data_module() location.")
+else:
+    s = s.replace(marker, assignment + marker, 1)
+    p.write_text(s)
+    print("PATCH SUCCESS: data_args.image_processor = image_processor")
+PY
+
+grep -n -C 3 "data_args.image_processor" llava/train/train.py
+
+python -m py_compile llava/train/train.py
+echo "PYTHON CHECK EXIT CODE: $?"
+
+export WANDB_DISABLED=true
+export WANDB_MODE=disabled
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+conda activate /workdir/bt730491/conda_envs/llava
+cd /workdir/bt730491/CAD-Coder
+
+export BASE=/workdir/bt730491/cadcoder_data/models/CAD-Coder
+export PREV=/workdir/bt730491/cadcoder_data/finetuned_freecad
+export DATA=/workdir/bt730491/CAD-Coder/freecad_dataset
+export OUT=/workdir/bt730491/CAD-Coder/checkpoints/freecad_macro_2000
+
+export WANDB_DISABLED=true
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export LD_LIBRARY_PATH=$(python -c "import torch,os;print(os.path.join(os.path.dirname(torch.__file__),'lib'))"):$LD_LIBRARY_PATH
+
+rm -rf "$OUT" && mkdir -p "$OUT"
+
+CUDA_VISIBLE_DEVICES=0 python -m llava.train.train_mem \
+  --model_name_or_path "$BASE" \
+  --version v1 \
+  --data_path "$DATA/jsonl/train.json" \
+  --image_folder "$DATA/images" \
+  --vision_tower openai/clip-vit-large-patch14-336 \
+  --mm_projector_type mlp2x_gelu \
+  --mm_use_im_start_end False \
+  --mm_use_im_patch_token False \
+  --image_aspect_ratio pad \
+  --lazy_preprocess True \
+  --output_dir "$OUT" \
+  --lora_enable True \
+  --lora_weight_path "$PREV" \
+  --lora_r 128 \
+  --lora_alpha 256 \
+  --lora_dropout 0.05 \
+  --bf16 True \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 16 \
+  --learning_rate 1e-5 \
+  --num_train_epochs 5 \
+  --gradient_checkpointing True \
+  --save_strategy epoch \
+  --save_total_limit 3 \
+  --logging_steps 1 \
+  2>&1 | tee "$OUT/training.log"
